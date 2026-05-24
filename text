@@ -1,0 +1,545 @@
+Ты получаешь заготовку проекта для Revit-агента. Нужно адаптировать проект под агента трассировки кабельных лотков по активному виду Revit.
+
+Цель:
+Создать архитектуру агента-трассировщика лотков, который по пользовательскому запросу строит маршрут кабельных лотков в активном виде Revit на основе:
+- контуров пространств на активном виде;
+- элементов на активном виде;
+- выбранных/найденных стартовых и целевых точек или элементов;
+- разрешенных транзитных пространств;
+- ограничений пользователя.
+
+Важно:
+LLM НЕ должна считать геометрию координатами сама.
+LLM НЕ должна сама строить маршрут вручную.
+LLM НЕ должна сама проверять пересечения.
+LLM НЕ должна сама создавать Revit-элементы напрямую.
+
+LLM должна:
+- разобрать запрос пользователя;
+- определить старт, цели, транзитные пространства и ограничения;
+- выбрать стратегию маршрутизации;
+- вызвать нужные tools;
+- обработать результаты tools;
+- решить, нужно ли уточнение;
+- выбрать repair-действие по результатам валидации;
+- сформировать понятный отчет пользователю.
+
+Геометрию, графы, коллизии, контуры, порталы, фитинги и создание элементов должны выполнять только детерминированные tools.
+
+Требования к целевой архитектуре:
+
+1. Сделать центральный Deterministic Orchestrator.
+Он не должен быть LLM-агентом.
+Он должен:
+- хранить состояние задачи;
+- запускать LLM-роли;
+- запускать tools;
+- ограничивать число итераций;
+- запрещать запись в модель при неоднозначности;
+- запрещать запись в модель при ошибках валидации;
+- вызывать Safety Critic перед записью;
+- делать rollback при ошибке создания;
+- формировать финальный ответ.
+
+2. Сделать единое состояние RoutingState.
+
+Минимальная структура RoutingState:
+
+{
+  "user_request": "...",
+  "task_spec": {},
+  "active_view": {},
+  "scene": {
+    "spaces": [],
+    "elements": [],
+    "existing_cable_trays": [],
+    "obstacles": []
+  },
+  "route_domain": {
+    "allowed_spaces": [],
+    "terminal_spaces": [],
+    "forbidden_spaces": [],
+    "portals": [],
+    "navigation_graph": {}
+  },
+  "terminals": [],
+  "route_strategy": {},
+  "route_skeleton": {},
+  "route_tree": {},
+  "validation": {
+    "errors": [],
+    "warnings": []
+  },
+  "repair_attempts": [],
+  "materialization_plan": {},
+  "write_allowed": false,
+  "final_report": {}
+}
+
+Если проект на C#, создай соответствующие DTO/classes.
+Если проект на TypeScript/Python, создай соответствующие interfaces/classes/schemas.
+Не используй динамическую кашу без схемы.
+
+3. Сделать следующие LLM-роли.
+
+Agent 1: TaskSpec Agent
+
+Задача:
+Преобразует пользовательский запрос в строгий TaskSpec.
+
+Он должен извлекать:
+- размер лотка;
+- тип лотка;
+- высоту, если указана;
+- стартовые элементы/точки/пространства;
+- целевые элементы/точки/пространства;
+- разрешенные транзитные пространства;
+- пространства, куда можно только зайти/выйти;
+- режим: single route или multi-terminal tree;
+- нужно ли создавать элементы в модели;
+- ограничения: только по коридорам, не заходить в офисы, через выбранные пространства и т.д.;
+- политику неоднозначности.
+
+Пример выхода:
+
+{
+  "task_type": "cable_tray_routing_active_view",
+  "scope": "active_view",
+  "write_model": true,
+  "tray": {
+    "width_mm": 100,
+    "height_mm": 50,
+    "type_query": "НСИ 0.7"
+  },
+  "routing_mode": "multi_terminal_tree",
+  "start": {
+    "source": "query",
+    "query": "электрощитовая"
+  },
+  "targets": [
+    {
+      "source": "query",
+      "query": "панель"
+    }
+  ],
+  "transit_space_policy": {
+    "allowed_transit_query": "коридор",
+    "terminal_spaces_allowed_for_entry_exit": true
+  },
+  "preferred_strategy": "main_trunk_with_branches",
+  "ambiguity_policy": "ask_before_write"
+}
+
+TaskSpec Agent не должен вызывать Revit tools напрямую.
+
+Agent 2: Target / Space Resolver Agent
+
+Задача:
+На основе результатов поиска по активному виду определить:
+- настоящий старт;
+- настоящие цели;
+- транзитные пространства;
+- terminal spaces;
+- forbidden spaces;
+- rejected candidates;
+- ambiguous candidates;
+- need_clarification.
+
+Особое правило:
+Если пользователь говорит "электрощитовая", это чаще всего пространство, а не электрооборудование.
+Если пользователь говорит "щит", "панель", "ВРУ", "АВР", это чаще всего элементы категории электрооборудования.
+Нельзя смешивать пространство и элемент без явного основания.
+
+Пример выхода:
+
+{
+  "resolved_start": {
+    "kind": "space",
+    "space_id": 123,
+    "name": "Электрощитовая",
+    "confidence": 0.94
+  },
+  "resolved_targets": [
+    {
+      "kind": "element",
+      "element_id": 138591,
+      "category": "Электрооборудование",
+      "name": "6ЩАП1",
+      "confidence": 0.92
+    }
+  ],
+  "allowed_transit_spaces": [1001, 1002, 1003],
+  "terminal_spaces": [123, 124],
+  "rejected_candidates": [
+    {
+      "id": 555,
+      "reason": "Элемент не соответствует смыслу запроса"
+    }
+  ],
+  "needs_clarification": false
+}
+
+Agent 3: Route Strategy Agent
+
+Задача:
+Выбрать стратегию маршрутизации, но не строить геометрию.
+
+Доступные стратегии:
+- direct_single_route;
+- portal_graph_route;
+- main_trunk_with_branches;
+- corridor_spine_strategy;
+- existing_route_attachment;
+- repair_existing_route.
+
+Для нескольких целей предпочтительная стратегия:
+main_trunk_with_branches.
+
+Логика:
+- если одна цель и старт/цель в одном пространстве - direct_single_route;
+- если одна цель и разные пространства - portal_graph_route;
+- если несколько целей - main_trunk_with_branches;
+- если пользователь явно говорит "ходить по коридорам" - corridor_spine_strategy;
+- если надо подключиться к существующей трассе - existing_route_attachment;
+- если маршрут уже есть и надо исправлять - repair_existing_route.
+
+Пример выхода:
+
+{
+  "strategy": "main_trunk_with_branches",
+  "reason": "Несколько целей расположены в разных пространствах, рациональнее построить магистраль и подключить ветки.",
+  "tool_sequence": [
+    "build_space_portal_graph",
+    "select_main_trunk_terminals",
+    "route_main_trunk",
+    "connect_terminals_to_trunk",
+    "merge_nearby_tees_to_crosses",
+    "simplify_route_tree",
+    "validate_route_tree"
+  ],
+  "fallbacks": [
+    "alternative_portal_route",
+    "local_branch_reroute",
+    "local_detour"
+  ]
+}
+
+Agent 4: Repair Decision Agent
+
+Задача:
+Включается только если validation tools нашли ошибки.
+Не двигает координаты сам.
+Выбирает repair action.
+
+Возможные repair actions:
+- reroute_branch;
+- try_local_detour;
+- try_shift_collinear_route_part;
+- try_alternative_portal_route;
+- merge_nearby_tees_to_crosses;
+- simplify_route_tree;
+- rollback_bad_repair;
+- fail_with_explanation.
+
+Пример выхода:
+
+{
+  "repair_plan": [
+    {
+      "action": "try_shift_collinear_route_part",
+      "target": {
+        "segment_id": "S12",
+        "collision_cluster_id": "C3"
+      },
+      "reason": "Коллизия находится на прямолинейном участке. Нужно двигать только коллинеарную часть этой трассы, а не всю трассу."
+    }
+  ]
+}
+
+Agent 5: Safety Critic Agent
+
+Задача:
+Запускается перед записью в модель.
+Должен дать жесткий verdict.
+
+Проверяет:
+- все цели однозначно определены;
+- есть активный вид и уровень;
+- тип лотка найден;
+- route_tree валиден;
+- маршрут идет только по разрешенным пространствам;
+- границы пространств не нарушены;
+- пересечения границ происходят только через порталы;
+- нет непочиненных коллизий;
+- фитинги можно создать;
+- dry run materialization успешен;
+- write_model явно разрешен.
+
+Пример выхода:
+
+{
+  "verdict": "allow_write",
+  "blocking_issues": [],
+  "warnings": [
+    "Один портал имеет малый запас по ширине."
+  ]
+}
+
+Или:
+
+{
+  "verdict": "block_write",
+  "blocking_issues": [
+    {
+      "type": "unresolved_target",
+      "message": "Цель 'панель' нашла несколько элементов с одинаковой уверенностью."
+    }
+  ],
+  "safe_next_action": "ask_user_clarification"
+}
+
+4. Создать Tool Catalog.
+
+Нужно создать интерфейс tool и каталог доступных tools.
+Каждый tool должен иметь:
+- name;
+- description;
+- input schema;
+- output schema;
+- safety notes;
+- failure modes.
+
+Минимальный набор tools для MVP:
+
+Scene collection:
+1. get_active_view_context
+2. collect_space_contours_active_view
+3. collect_visible_elements_active_view
+4. collect_existing_cable_trays_active_view
+5. find_candidate_targets
+
+Geometry preprocessing:
+6. normalize_space_contours
+7. build_space_domain
+8. detect_portals_between_spaces
+9. build_space_portal_graph
+10. map_points_to_spaces
+11. build_obstacle_map
+
+Routing:
+12. select_main_trunk_terminals
+13. route_between_terminals_via_spaces
+14. build_route_tree_main_trunk_with_branches
+15. route_branch_to_trunk
+16. orthogonalize_route
+17. merge_nearby_tees_to_crosses
+18. simplify_route_tree
+
+Validation:
+19. validate_route_tree
+20. check_route_inside_allowed_spaces
+21. check_route_obstacle_collisions
+22. check_fitting_feasibility
+23. check_route_self_intersections
+
+Repair:
+24. cluster_route_violations
+25. try_local_detour
+26. try_shift_collinear_route_part
+27. try_alternative_portal_route
+28. try_branch_reroute
+29. try_merge_tees_to_cross
+30. rollback_bad_repair
+
+Materialization:
+31. find_cable_tray_type
+32. build_materialization_plan
+33. dry_run_materialization
+34. create_route_transaction
+35. verify_created_route
+
+Reporting:
+36. build_route_preview_report
+37. build_failure_report
+
+Если в текущей заготовке проекта уже есть похожие tools, не дублируй их. Адаптируй существующие.
+
+5. Особые требования к tools.
+
+collect_space_contours_active_view:
+- должен получать контуры из самих Space/пространств;
+- не должен полагаться только на стены;
+- должен учитывать, что границы могут быть образованы связанными моделями;
+- должен сохранять выступы, holes и внутренние loops;
+- должен возвращать outer_loop, inner_loops, bbox, area, name, number, level_id.
+
+detect_portals_between_spaces:
+- должен находить смежность пространств;
+- должен учитывать общую границу;
+- должен учитывать зазор между контурами до настраиваемого допуска, например 800 мм;
+- должен возвращать portal_id, space_a, space_b, center, width_mm, segment, confidence.
+
+build_space_domain:
+- должен разделять пространства на роли:
+  - transit;
+  - terminal;
+  - forbidden;
+- terminal space можно использовать для входа/выхода;
+- transit space можно использовать для прохода;
+- одно пространство может быть одновременно terminal и transit.
+
+route_between_terminals_via_spaces:
+- должен строить путь через graph spaces/portals;
+- не должен проходить через forbidden spaces;
+- должен возвращать route skeleton, а не Revit elements.
+
+build_route_tree_main_trunk_with_branches:
+- для нескольких целей должен строить одно дерево трассы;
+- нельзя создавать независимую трассу для каждой цели;
+- основная логика:
+  - выбрать две самые дальние точки по Manhattan distance;
+  - построить основную магистраль;
+  - остальные цели подключать ветками к магистрали;
+  - если две ветки рядом и с разных сторон, пробовать крестовину вместо двух тройников.
+
+orthogonalize_route:
+- маршрут должен быть в плане под 90 градусов;
+- микросмещения можно решать через 45 градусов;
+- нельзя создавать произвольные диагонали;
+- нужно удалять почти нулевые сегменты;
+- нужно удалять поворот в повороте;
+- нужно схлопывать лишние точки.
+
+try_shift_collinear_route_part:
+- нельзя двигать всю трассу;
+- нужно двигать только часть трассы, которая лежит на одной линии с проблемным сегментом;
+- остальные части трассы с другими направлениями не трогать.
+
+check_fitting_feasibility:
+- должен проверять, что фитинги можно создать;
+- должен ловить слишком короткие сегменты между фитингами;
+- должен ловить два поворота слишком близко;
+- должен ловить инвертированные/наложенные повороты;
+- должен предлагать заменить два близких tee на cross, если это логично.
+
+create_route_transaction:
+- должен создавать все элементы в одной транзакции;
+- при ошибке должен делать rollback;
+- нельзя писать в модель без успешного dry_run_materialization и Safety Critic allow_write.
+
+verify_created_route:
+- после создания должен заново прочитать модель;
+- проверить, что реально созданы сегменты и фитинги;
+- проверить, что количество созданных элементов совпадает с планом;
+- проверить, что нет разрывов;
+- если Revit сообщил успех, но элементы не найдены, это ошибка.
+
+6. Pipeline оркестратора.
+
+Реализовать примерно такой pipeline:
+
+1. Получить user_request.
+2. TaskSpec Agent -> task_spec.
+3. get_active_view_context.
+4. collect_space_contours_active_view.
+5. collect_visible_elements_active_view.
+6. collect_existing_cable_trays_active_view.
+7. find_candidate_targets для start/targets/transit spaces.
+8. Target / Space Resolver Agent.
+9. Если needs_clarification=true - вернуть пользователю уточнение, не писать в модель.
+10. normalize_space_contours.
+11. build_space_domain.
+12. detect_portals_between_spaces.
+13. build_space_portal_graph.
+14. map_points_to_spaces.
+15. build_obstacle_map.
+16. Route Strategy Agent.
+17. Выполнить routing tools согласно стратегии.
+18. orthogonalize_route.
+19. simplify_route_tree.
+20. validate_route_tree.
+21. Если есть ошибки - запустить Repair Decision Agent и repair tools.
+22. Ограничить количество repair iterations, например максимум 3.
+23. Если после repair маршрут невалиден - build_failure_report.
+24. find_cable_tray_type.
+25. build_materialization_plan.
+26. dry_run_materialization.
+27. Safety Critic Agent.
+28. Если verdict=block_write - вернуть safe_next_action.
+29. Если allow_write - create_route_transaction.
+30. verify_created_route.
+31. build_route_preview_report или final success report.
+
+7. Важные safety rules.
+
+Жестко запретить:
+- whole document scope, если пользователь просит active view;
+- запись в модель при неоднозначных целях;
+- запись в модель при невалидном route_tree;
+- прохождение через forbidden spaces;
+- пересечение границ пространств не через portals;
+- создание независимых трасс к каждой цели при multi-target запросе;
+- создание элементов без dry run;
+- создание элементов без post-create verification;
+- использование LLM для точных геометрических вычислений.
+
+8. Формат результата работы.
+
+После анализа проекта:
+- сначала кратко опиши, какая текущая структура проекта найдена;
+- затем предложи новую структуру файлов/classes/modules;
+- затем внеси изменения в проект;
+- если полноценная реализация Revit geometry tools невозможна за один проход, создай интерфейсы, DTO, заглушки с явными TODO и реализуй оркестратор, схемы, промпты агентов и tool catalog;
+- не оставляй архитектуру только в тексте, нужно создать реальный код/файлы;
+- не ломай существующие публичные интерфейсы без необходимости;
+- если есть тесты, обнови или добавь минимальные тесты;
+- если есть сборка, не используй возможности языка выше доступной версии проекта.
+
+9. Для C# / Revit 2023 особые ограничения.
+
+Если проект C# под Revit 2023:
+- целевая среда: Revit 2023;
+- .NET Framework 4.8;
+- C# 7.3;
+- не использовать record;
+- не использовать init;
+- не использовать switch expressions;
+- не использовать nullable reference types;
+- не использовать file-scoped namespaces;
+- не использовать async features, если проект их не поддерживает;
+- избегать неоднозначности между Autodesk.Revit.DB.Form и System.Windows.Forms.Form;
+- Revit write operations только внутри Transaction;
+- read-only collection не должен открывать Transaction;
+- ошибки показывать через существующий механизм проекта или TaskDialog, если это Revit ExternalCommand.
+
+10. Что должно получиться в итоге.
+
+В проекте должны появиться или быть адаптированы:
+
+- RoutingState;
+- TaskSpec;
+- SceneSnapshot;
+- SpaceContourDto;
+- ElementCandidateDto;
+- PortalDto;
+- RouteDomain;
+- RouteSkeleton;
+- RouteTree;
+- RouteValidationResult;
+- RepairPlan;
+- MaterializationPlan;
+- ToolCatalog;
+- ToolExecutor;
+- AgentPromptCatalog;
+- CableTrayRoutingOrchestrator;
+- Safety gates before write;
+- MVP pipeline для трассировки лотков.
+
+Финальная система должна позволять подключить реальный LLM backend и реальные Revit tools, но архитектура должна быть уже готова: state, agents, tools, validators, repair loop, write gate.
+
+Главный принцип:
+LLM управляет смыслом, стратегией и неоднозначностями.
+Tools считают геометрию.
+Validator защищает от мусора.
+Critic включается только перед рискованными действиями.
+Revit writer пишет модель только после dry run и allow_write.
